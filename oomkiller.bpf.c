@@ -14,7 +14,6 @@
 #define TH_MAX  100
 #define RND_MAX 100
 
-
 /* We have to use __u32 everywhere, because operations are atomic only on 32 and 64 bit values. */
 struct counters {
     __u32 rd_cnt;    // 0-10 000 000
@@ -65,7 +64,7 @@ bool check_oomp(pid_t pid) {
     return val ? true : false;
 }
 
-// Move from 'monitoring' map to 'to_kill' map.
+/* Move from 'monitoring' map to 'to_kill' map. */
 void move_to_kill(pid_t pid) {
     struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
     bpf_map_delete_elem(&monitoring, &pid);
@@ -74,28 +73,54 @@ void move_to_kill(pid_t pid) {
 
 }
 
-// Check if the name of the process contains 'oomp'.
-//SEC() // TODO: hook on process creation
-bool check_process_name(pid_t pid) {
-    struct task_struct *task = (void *)bpf_get_current_task();
-    char comm[16];
-    BPF_CORE_READ_STR_INTO(&comm, task, comm);
+/* If the new process was created, give it's name to the userspace */
+/* If the new thread was created, trace it. */
+SEC("tp/sched/sched_process_fork")
+bool handle_process_or_thread_creation(struct trace_event_raw_sched_process_fork* ctx) {
+    pid_t pid = bpf_get_current_pid_tgid() >> 32;
+    pid_t tid = (__u32)bpf_get_current_pid_tgid();
 
-    // We transfer the name of the process to the userspace for analysis.
-    struct ringbuf_data *rb_data = bpf_ringbuf_reserve(&ring_buffer, sizeof(struct ringbuf_data), 0);
-    if(!rb_data) {
-        // if bpf_ringbuf_reserve fails, print an error message and return
-        bpf_printk("bpf_ringbuf_reserve failed\n");
-        return 1;
+    // TODO: distinguish process and thread creation + make it CO-RE
+    if (pid == tid) {
+        /* New process */
+        pid_t child_pid = ctx->child_pid;
+        bpf_printk("PID %d - new process created with pid %d.", pid, child_pid);
+        struct task_struct *task = (void *)bpf_get_current_task();
+        
+        // We transfer the name of the process to the userspace for analysis.
+        struct ringbuf_data *rb_data = bpf_ringbuf_reserve(&ring_buffer, sizeof(struct ringbuf_data), 0);
+        // Failed to reserve.
+        if(!rb_data) {
+            return 0;
+        }
+
+        rb_data->pid = child_pid;
+        BPF_CORE_READ_STR_INTO(&rb_data->name, task, comm);
+
+        bpf_ringbuf_submit(rb_data, 0);
+
+    } else {
+        /* New thread */
+        bpf_printk("PID %d - new thread created.", pid);
+        if (!check_oomp(pid) || check_to_kill(pid)) {
+            return 0;
+        }
+
+        struct counters init_val = { .th_cnt = 1 };
+        struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
+
+        __u32 current_cnt = 1;
+        if (!val)
+            bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
+        else
+            current_cnt = __sync_add_and_fetch(&val->th_cnt, 1);
+
+        if (current_cnt >= TH_MAX) {
+            move_to_kill(pid);
+        }
+
     }
-
-    rb_data->pid = pid;
-    rb_data->name = comm;
-
-    bpf_ringbuf_submit(rb_data, 0);
-
     return 0;
-    //return (strstr(comm, "oomp") != NULL);
 }
 
 /* Used file descriptors tracking. */
@@ -103,11 +128,12 @@ SEC("kretprobe/alloc_fd")
 int handle_fd(struct pt_regs *ctx) 
 {
     pid_t pid = bpf_get_current_pid_tgid() >> 32;
-    bpf_printk("PID %d created a file descriptor", pid);
 
     if (!check_oomp(pid) || check_to_kill(pid)) {
         return 0;
     }
+
+    bpf_printk("PID %d created a file descriptor", pid);
     long ret = PT_REGS_RC(ctx);
 
     // If no error occured.
@@ -119,7 +145,7 @@ int handle_fd(struct pt_regs *ctx)
         if (!val)
             bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
         else
-            current_cnt = __sync_add_and_fetch(&val->wrt_cnt, 1);
+            current_cnt = __sync_add_and_fetch(&val->fd_cnt, 1);
 
         if (current_cnt >= FD_MAX) {
             move_to_kill(pid);
@@ -133,11 +159,12 @@ static int __always_inline do_handle_write(struct pt_regs *ctx)
 {
     // We are not saving data about processes, that name has no 'oomp' string or are already sentenced to death.
     pid_t pid = bpf_get_current_pid_tgid() >> 32;
-    bpf_printk("PID %d written to the file.", pid);
     if (!check_oomp(pid) || check_to_kill(pid)) {
         return 0;
     }
     long ret = PT_REGS_RC(ctx);
+
+    bpf_printk("PID %d written to the file.", pid);
 
     if (ret >= 0) {
         struct counters init_val = { .wrt_cnt = 1 };
@@ -185,7 +212,7 @@ static int __always_inline do_handle_read(struct pt_regs *ctx)
         if (!val)
             bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
         else
-            current_cnt = __sync_add_and_fetch(&val->wrt_cnt, ret);
+            current_cnt = __sync_add_and_fetch(&val->rd_cnt, ret);
 
         if (current_cnt >= RD_MAX) {
             move_to_kill(pid);
@@ -224,16 +251,13 @@ int handle_rand(struct pt_regs *ctx) {
     if (!val)
         bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
     else
-        current_cnt = __sync_add_and_fetch(&val->wrt_cnt, 1);
+        current_cnt = __sync_add_and_fetch(&val->rnd_cnt, 1);
 
     if (current_cnt >= RND_MAX) {
         move_to_kill(pid);
     }
     return 0;
 }
-
-// threads: https://ancat.github.io/kernel/2021/05/20/hooking-processes-and-threads.html
-
 
 /* On exit, counters are deleted. */
 SEC("tp/sched/sched_process_exit")
