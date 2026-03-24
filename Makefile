@@ -15,7 +15,7 @@ deps:
 vmlinux.h:
 	sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
 
-oomkiller.bpf.o: oomkiller.bpf.c vmlinux.h
+oomkiller.bpf.o: oomkiller.bpf.c vmlinux.h clone_flags.h
 	$(CLANG) $(BPF_CFLAGS) -c oomkiller.bpf.c -o $@
 
 oomkiller.skel.h: oomkiller.bpf.o
