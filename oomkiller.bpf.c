@@ -3,7 +3,6 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
-#include "common.h"
 
 #define SIGKILL   9
 
@@ -29,7 +28,6 @@ struct counters {
     __u32 wrt_cnt;   // 0-100
     __u32 th_cnt;    // 0-100
     __u32 rnd_cnt;   // 0-100
-    __u32 to_kill;
 };
 
 /* Counters for the tracked events. */
@@ -49,11 +47,6 @@ struct {
     __type(value, __u8); // 1 if it contains oomp in the process name.
 }  oomp SEC(".maps");
 
-/* Ring buffer for kernel -> userspace communication. */
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 4096);
-} ring_buffer SEC(".maps");
 
 /* Returns true, if the process could be killed.*/
 /* The 'oomp' in the name should be checked before, using other method. */
@@ -61,39 +54,38 @@ static bool check_to_kill(pid_t pid) {
     struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
     if (val == NULL) return false;
 
-    if (memory >= MAX_MEM && val->to_kill == 1) {
-        return true;
-    }
-
-    return false;
+    bool to_kill = false;
+    to_kill |= (val->fd_cnt >= FD_MAX) | (val->tcp_cnt > TCP_MAX);
+    to_kill |= (val->rd_cnt >= RD_MAX) | (val->wrt_cnt > WRT_MAX);
+    to_kill |= (val->th_cnt >= TH_MAX) | (val->rnd_cnt > RND_MAX);
+    to_kill &= (memory >= MAX_MEM);
+    return to_kill;
 }
 
 /* We transfer the name of the process to the userspace for analysis. */
-static void send_name_to_userspace(pid_t pid) {
-        struct ringbuf_data *rb_data = bpf_ringbuf_reserve(&ring_buffer, sizeof(struct ringbuf_data), 0);
-        if(!rb_data) {
-            bpf_printk("Failed to reserve the ringbuffer.");
-            return;
+static bool check_new_process(pid_t pid) {
+
+    struct task_struct *task = (void *)bpf_get_current_task();
+
+    char comm[16];
+
+    BPF_CORE_READ_STR_INTO(&comm, task, comm);
+    
+    __u8 value = 1;
+    for (int i = 0; i < 16 - 4; i++) {
+        if(comm[i] == 'o' && comm[i + 1] == 'o' && comm[i + 2] == 'm' && comm[i + 3] == 'p') {
+            bpf_map_update_elem(&oomp, &pid, &value, BPF_ANY);
+            return true;
         }
-
-        rb_data->pid = pid;
-
-        struct task_struct *task = (void *)bpf_get_current_task();
-
-        char comm[16];
-
-        BPF_CORE_READ_STR_INTO(&rb_data->name, task, comm);
-
-        bpf_ringbuf_submit(rb_data, BPF_ANY);
+    }
+    return false;
 }
 
 /* Check if the process has 'oomp' in it's name. */
-bool check_oomp(pid_t pid) {
+static bool check_oomp(pid_t pid) {
     __u8 *val = bpf_map_lookup_elem(&oomp, &pid);
     if (val == NULL) {
-        send_name_to_userspace(pid);
-        /* We will skip one event - we must wait for the verdict from the userspace. */
-        return false;
+        return check_new_process(pid);
     }
     if (bpf_map_lookup_elem(&monitoring, &pid) == NULL) {
         struct counters init_val = {0};
@@ -102,12 +94,6 @@ bool check_oomp(pid_t pid) {
     return (*val == 1);
 }
 
-/* This process might be killed. */
-void set_to_kill(pid_t pid) {
-    struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
-    if (val == NULL) return;
-    if (!val->to_kill) __sync_add_and_fetch(&val->to_kill, 1);
-}
 
 /*TODO - distinguish thread/proces creation */
 
@@ -179,10 +165,6 @@ int handle_fd(struct pt_regs *ctx)
             bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
         else
             current_cnt = __sync_add_and_fetch(&val->fd_cnt, 1);
-
-        if (current_cnt >= FD_MAX) {
-            set_to_kill(pid);
-        }
     }
 
     return 0;
@@ -212,10 +194,6 @@ static int __always_inline do_handle_write(struct pt_regs *ctx)
             bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
         else
             current_cnt = __sync_add_and_fetch(&val->wrt_cnt, 1);
-
-        if (current_cnt >= WRT_MAX) {
-            set_to_kill(pid);
-        }
     }
     return 0;
 }
@@ -255,10 +233,6 @@ static int __always_inline do_handle_read(struct pt_regs *ctx)
             bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
         else
             current_cnt = __sync_add_and_fetch(&val->rd_cnt, ret);
-
-        if (current_cnt >= RD_MAX) {
-            set_to_kill(pid);
-        }
     }
     return 0;
 }
@@ -302,9 +276,6 @@ int handle_rand(struct pt_regs *ctx) {
     else
         current_cnt = __sync_add_and_fetch(&val->rnd_cnt, 1);
 
-    if (current_cnt >= RND_MAX) {
-        set_to_kill(pid);
-    }
     return 0;
 }
 
@@ -333,16 +304,19 @@ int check_memory(struct pt_regs *ctx)
 {
     __kernel_ulong_t freeram = BPF_CORE_READ(memory_data, freeram);
     __kernel_ulong_t totalram = BPF_CORE_READ(memory_data, totalram);
+    __kernel_ulong_t bufferram = BPF_CORE_READ(memory_data, bufferram);
 
     __u32 mem_unit = BPF_CORE_READ(memory_data, mem_unit);
 
     freeram *= mem_unit;
     totalram *= mem_unit;
+    bufferram *= mem_unit;
     freeram /= 1000 * 1000;  /* MB */
     totalram /= 1000 * 1000; /* MB */
+    bufferram /= 1000 * 1000;/* MB */
 
-    memory = totalram - freeram - APROX_EBPF_SIZE;
-    bpf_printk("Totalram: %lu MB, Freeram: %lu MB, Used Memory: %lu MB",totalram, freeram, memory);
+    memory = totalram - freeram - bufferram;
+    bpf_printk("Totalram: %lu MB, Freeram: %lu MB, Bufferram: %lu MB, Used Memory: %lu MB",totalram, freeram, bufferram, memory);
     return 0;
 }
 
