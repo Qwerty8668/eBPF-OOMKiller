@@ -4,6 +4,7 @@
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
 #include "clone_flags.h"
+
 #define SIGKILL   9
 
 #define MAX_PROCESSES 4194304
@@ -44,19 +45,17 @@ static bool check_to_kill(pid_t pid) {
     if (val == NULL) return false;
 
     bool to_kill = false;
-    to_kill |= (val->fd_cnt >= FD_MAX) | (val->tcp_cnt > TCP_MAX);
-    to_kill |= (val->rd_cnt >= RD_MAX) | (val->wrt_cnt > WRT_MAX);
-    to_kill |= (val->th_cnt >= TH_MAX) | (val->rnd_cnt > RND_MAX);
+    to_kill |= (val->fd_cnt >= FD_MAX) | (val->tcp_cnt >= TCP_MAX);
+    to_kill |= (val->rd_cnt >= RD_MAX) | (val->wrt_cnt >= WRT_MAX);
+    to_kill |= (val->th_cnt >= TH_MAX) | (val->rnd_cnt >= RND_MAX);
     to_kill &= (memory >= MAX_MEM_MB);
     return to_kill;
 }
 
 /* Check if the process has 'oomp' in it's name. */
 static bool check_oomp(pid_t pid) {
-    struct task_struct *task = (void *)bpf_get_current_task();
-
     char comm[16];
-    BPF_CORE_READ_STR_INTO(&comm, task, comm);
+    bpf_get_current_comm(&comm, sizeof(comm));
 
     for (int i = 0; i < 16 - 4; i++) {
         if(comm[i] == 'o' && comm[i + 1] == 'o' && comm[i + 2] == 'm' && comm[i + 3] == 'p') {
@@ -66,118 +65,7 @@ static bool check_oomp(pid_t pid) {
     return false;
 }
 
-SEC("tp/syscalls/sys_enter_clone3")
-int handle_threads(struct trace_event_raw_sys_enter *ctx) {
-
-    pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-    if (!check_oomp(pid)) {
-        return 0;
-    }
-
-    if (check_to_kill(pid)) {
-        bpf_send_signal(SIGKILL);
-        return 0;
-    }
-
-    long unsigned int args[6];
-    BPF_CORE_READ_INTO(&args, ctx, args);
-    struct clone_args *cl_args = (void *)args[0];
-
-    __u64 flags;
-    bpf_probe_read_user(&flags, sizeof(flags), &cl_args->flags);
-
-    struct counters init_val = { .th_cnt = 1 };
-    struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
-
-    /* Clone3 flags for thread creation (pthread_create). */
-    if (flags == (CLONE_VM | CLONE_FS | CLONE_FILES | 
-        CLONE_SYSVSEM | CLONE_SIGHAND | CLONE_THREAD |
-         CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID)) {
-
-        bpf_printk("PID: %d created a thread.", pid);
-
-        if (!val)
-            bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
-        else
-            __sync_add_and_fetch(&val->th_cnt, 1);
-    }
-    return 0;
-}
-
-/* Tracking used file descriptors. */
-SEC("kretprobe/alloc_fd")
-int handle_fd(struct pt_regs *ctx) 
-{
-    pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-    if (!check_oomp(pid)) {
-        return 0;
-    }
-
-    if (check_to_kill(pid)) {
-        bpf_send_signal(SIGKILL);
-        return 0;
-    }
-
-    long ret = PT_REGS_RC(ctx);
-
-    // If no error occured.
-    if (ret >= 0) {
-        bpf_printk("PID %d created a file descriptor.", pid);
-        struct counters init_val = { .fd_cnt = 1 };
-        struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
-
-        if (!val)
-            bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
-        else
-            __sync_add_and_fetch(&val->fd_cnt, 1);
-    }
-
-    return 0;
-}
-
-static int __always_inline do_handle_write(struct pt_regs *ctx)
-{
-    pid_t pid = bpf_get_current_pid_tgid() >> 32;
-    if (!check_oomp(pid)) {
-        return 0;
-    }
-
-    if (check_to_kill(pid)) {
-        bpf_send_signal(SIGKILL);
-        return 0;
-    }
-    long ret = PT_REGS_RC(ctx);
-
-    if (ret >= 0) {
-        bpf_printk("PID %d written to the file.", pid);
-        struct counters init_val = { .wrt_cnt = 1 };
-        struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
-
-        if (!val)
-            bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
-        else
-            __sync_add_and_fetch(&val->wrt_cnt, 1);
-    }
-    return 0;
-}
-
-/* Tracking writing to files. */
-SEC("kretprobe/vfs_write")
-int handle_write(struct pt_regs *ctx)
-{
-    return do_handle_write(ctx);
-}
-
-SEC("kretprobe/vfs_writev")
-int handle_writev(struct pt_regs *ctx)
-{
-    return do_handle_write(ctx);
-}
-
-static int __always_inline do_handle_read(struct pt_regs *ctx)
-{
+static int __always_inline do_handle_read(struct pt_regs *ctx) {
     pid_t pid = bpf_get_current_pid_tgid() >> 32;
     if (!check_oomp(pid)) {
         return 0;
@@ -203,44 +91,16 @@ static int __always_inline do_handle_read(struct pt_regs *ctx)
 
 /* Tracking reading from files. */
 SEC("kretprobe/vfs_read")
-int handle_read(struct pt_regs *ctx)
-{
+int handle_read(struct pt_regs *ctx) {
     return do_handle_read(ctx);
 }
 
 SEC("kretprobe/vfs_readv")
-int handle_readv(struct pt_regs *ctx)
-{
+int handle_readv(struct pt_regs *ctx) {
     return do_handle_read(ctx);
 }
 
-/* Tracking rand() function from libc. */
-SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:rand")
-int handle_rand(struct pt_regs *ctx) {
-    pid_t pid = bpf_get_current_pid_tgid() >> 32;
-
-    if (!check_oomp(pid)) {
-        return 0;
-    }
-
-    if (check_to_kill(pid)) {
-        bpf_send_signal(SIGKILL);
-        return 0;
-    }
-
-    bpf_printk("PID %d used a rand function.", pid);
-
-    struct counters init_val = { .rnd_cnt = 1 };
-    struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
-
-    if (!val)
-        bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
-    else
-        __sync_add_and_fetch(&val->rnd_cnt, 1);
-
-    return 0;
-}
-
+/* Tracing sending TCP packets. */
 SEC("tracepoint/syscalls/sys_enter_sendto")
 int handle_tcp(struct trace_event_raw_sys_enter* ctx) {
 
@@ -277,10 +137,142 @@ int handle_tcp(struct trace_event_raw_sys_enter* ctx) {
     return 0;
 }
 
+/* Tracking used file descriptors. */
+SEC("kretprobe/alloc_fd")
+int handle_fd(struct pt_regs *ctx) {
+    pid_t pid = bpf_get_current_pid_tgid() >> 32;
+
+    if (!check_oomp(pid)) {
+        return 0;
+    }
+
+    if (check_to_kill(pid)) {
+        bpf_send_signal(SIGKILL);
+        return 0;
+    }
+
+    long ret = PT_REGS_RC(ctx);
+
+    // If no error occured.
+    if (ret >= 0) {
+        bpf_printk("PID %d created a file descriptor.", pid);
+        struct counters init_val = { .fd_cnt = 1 };
+        struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
+
+        if (!val)
+            bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
+        else
+            __sync_add_and_fetch(&val->fd_cnt, 1);
+    }
+
+    return 0;
+}
+
+static int __always_inline do_handle_write(struct pt_regs *ctx) {
+    pid_t pid = bpf_get_current_pid_tgid() >> 32;
+    if (!check_oomp(pid)) {
+        return 0;
+    }
+
+    if (check_to_kill(pid)) {
+        bpf_send_signal(SIGKILL);
+        return 0;
+    }
+    long ret = PT_REGS_RC(ctx);
+
+    if (ret >= 0) {
+        bpf_printk("PID %d written to the file.", pid);
+        struct counters init_val = { .wrt_cnt = 1 };
+        struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
+
+        if (!val)
+            bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
+        else
+            __sync_add_and_fetch(&val->wrt_cnt, 1);
+    }
+    return 0;
+}
+
+/* Tracking writing to files. */
+SEC("kretprobe/vfs_write")
+int handle_write(struct pt_regs *ctx) {
+    return do_handle_write(ctx);
+}
+
+SEC("kretprobe/vfs_writev")
+int handle_writev(struct pt_regs *ctx) {
+    return do_handle_write(ctx);
+}
+
+/* Tracking created threads. */
+SEC("tp/syscalls/sys_enter_clone3")
+int handle_threads(struct trace_event_raw_sys_enter *ctx) {
+
+    pid_t pid = bpf_get_current_pid_tgid() >> 32;
+
+    if (!check_oomp(pid)) {
+        return 0;
+    }
+
+    if (check_to_kill(pid)) {
+        bpf_send_signal(SIGKILL);
+        return 0;
+    }
+
+    long unsigned int args[6];
+    BPF_CORE_READ_INTO(&args, ctx, args);
+    struct clone_args *cl_args = (void *)args[0];
+
+    __u64 flags;
+    bpf_probe_read_user(&flags, sizeof(flags), &cl_args->flags);
+
+    /* Clone3 flags for thread creation (pthread_create). */
+    if (flags == (CLONE_VM | CLONE_FS | CLONE_FILES | 
+        CLONE_SYSVSEM | CLONE_SIGHAND | CLONE_THREAD |
+         CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID)) {
+
+        bpf_printk("PID: %d created a thread.", pid);
+        struct counters init_val = { .th_cnt = 1 };
+        struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
+
+        if (!val)
+            bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
+        else
+            __sync_add_and_fetch(&val->th_cnt, 1);
+    }
+    return 0;
+}
+
+/* Tracking rand() function from libc. */
+SEC("uprobe//lib/x86_64-linux-gnu/libc.so.6:rand")
+int handle_rand(struct pt_regs *ctx) {
+    pid_t pid = bpf_get_current_pid_tgid() >> 32;
+
+    if (!check_oomp(pid)) {
+        return 0;
+    }
+
+    if (check_to_kill(pid)) {
+        bpf_send_signal(SIGKILL);
+        return 0;
+    }
+
+    bpf_printk("PID %d used a rand function.", pid);
+
+    struct counters init_val = { .rnd_cnt = 1 };
+    struct counters *val = bpf_map_lookup_elem(&monitoring, &pid);
+
+    if (!val)
+        bpf_map_update_elem(&monitoring, &pid, &init_val, BPF_ANY);
+    else
+        __sync_add_and_fetch(&val->rnd_cnt, 1);
+
+    return 0;
+}
+
 /* On exit, counters are deleted. */
 SEC("tp/sched/sched_process_exit")
-int handle_exit(struct trace_event_raw_sched_process_exit* ctx) 
-{
+int handle_exit(struct trace_event_raw_sched_process_exit* ctx) {
     pid_t pid = bpf_get_current_pid_tgid() >> 32;
     bpf_printk("PID %d exited", pid);
     bpf_map_delete_elem(&monitoring, &pid);
@@ -289,16 +281,14 @@ int handle_exit(struct trace_event_raw_sched_process_exit* ctx)
 
 /* Get the pointer, where the data about the memory will be saved. */
 SEC("kprobe/si_meminfo")
-int check_memory_pointer(struct pt_regs *ctx)
-{
+int check_memory_pointer(struct pt_regs *ctx) {
     memory_data = (struct sysinfo *)PT_REGS_PARM1(ctx);
     return 0;
 }
 
 /* Get the actual data. */
 SEC("kretprobe/si_meminfo")
-int check_memory(struct pt_regs *ctx)
-{
+int check_memory(struct pt_regs *ctx) {
     __kernel_ulong_t freeram = BPF_CORE_READ(memory_data, freeram);
     __kernel_ulong_t totalram = BPF_CORE_READ(memory_data, totalram);
     __kernel_ulong_t bufferram = BPF_CORE_READ(memory_data, bufferram);
