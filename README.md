@@ -27,13 +27,13 @@ If a targeted process exceeds *any* of the following thresholds, it gets killed:
 ## Architecture Details
 
 * **Kernel Space (`*.bpf.c`):** Implements the core monitoring and killing logic using eBPF hooks (kprobes/tracepoints). 
-* **User Space (`*.c`):** A lightweight loader built with `libbpf` that attaches the BPF program and periodically triggers `si_meminfo` (e.g., once a second) to ensure memory stats are up-to-date.
+* **User Space (`*.user.c`):** A lightweight loader built with `libbpf` that attaches the BPF program and periodically triggers `si_meminfo` (e.g., once a second) to ensure memory stats are up-to-date.
 * **Data Structures:** Uses `BPF_MAP_TYPE_HASH` to maintain state and track resource usage per process.
-* **Memory Probing:** Utilizes `kprobe/si_meminfo` and/or `kretprobe/si_meminfo` for system-wide memory checks.
+* **Memory Probing:** Utilizes `kprobe/si_meminfo` and `kretprobe/si_meminfo` for system-wide memory checks.
 
 ## Prerequisites
 
-To build and run this project, you need a Linux environment (Kernel 6.18.5+ recommended) with the following tools installed:
+To build and run this project, you need a Linux environment (Kernel 6.18.5 recommended) with the following tools installed (you can install it using `make` or `make deps`):
 * `clang` & `llvm`
 * `libbpf-dev`
 * `bpftool` (Required to generate `vmlinux.h`)
